@@ -50,3 +50,5 @@ outputs/*.csv
 outputs/*.json
 .DS_Store
 Thumbs.db
+# Large dataset files (download separately)
+dataset/*.csv
