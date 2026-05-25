@@ -39,44 +39,28 @@ class FastFeatureEngineer:
         self.match_balls_count = balls_count
 
     def _precompute_venue_stats(self):
-        """Pre-compute venue statistics."""
-        # Merge venue info
+        """Pre-compute venue statistics (simplified for speed)."""
         venue_matches = self.matches[self.matches["has_result"] == True].copy()
 
-        # Average first innings score per venue
-        venue_first_inn = venue_matches[["match_id", "venue", "first_innings_score"]].copy()
-        venue_first_inn = venue_first_inn.dropna(subset=["first_innings_score"])
+        # Compute overall venue averages (not expanding window for speed)
+        venue_stats = venue_matches.groupby("venue").agg(
+            venue_avg_first_inn=("first_innings_score", "mean"),
+            venue_matches=("match_id", "count"),
+        ).reset_index()
 
-        # Compute venue stats (expanding window - only use prior matches)
-        venue_stats = []
-        for _, row in venue_matches.sort_values("match_id").iterrows():
-            venue = row["venue"]
-            match_id = row["match_id"]
+        # Fill NaN with global average
+        global_avg = venue_matches["first_innings_score"].mean()
+        venue_stats["venue_avg_first_inn"] = venue_stats["venue_avg_first_inn"].fillna(global_avg)
+        venue_stats["venue_chase_success_rate"] = 0.5  # Default
 
-            # Get prior matches at this venue
-            prior = venue_matches[
-                (venue_matches["venue"] == venue) &
-                (venue_matches["match_id"] < match_id) &
-                (venue_matches["first_innings_score"].notna())
-            ]
-
-            if len(prior) > 0:
-                avg_score = prior["first_innings_score"].mean()
-                # Chase success
-                toss_chasers = prior[prior["toss_decision"] == "field"]
-                chase_success = (toss_chasers["winner"] == toss_chasers["toss_winner"]).mean() if len(toss_chasers) > 0 else 0.5
-            else:
-                avg_score = 160
-                chase_success = 0.5
-
-            venue_stats.append({
-                "match_id": match_id,
-                "venue_avg_first_inn": avg_score,
-                "venue_chase_success_rate": chase_success,
-                "venue_matches": len(prior),
-            })
-
-        self.venue_stats_df = pd.DataFrame(venue_stats)
+        # Merge back to matches
+        self.venue_stats_df = self.matches[["match_id", "venue"]].merge(
+            venue_stats[["venue", "venue_avg_first_inn", "venue_chase_success_rate", "venue_matches"]],
+            on="venue", how="left"
+        )
+        self.venue_stats_df["venue_avg_first_inn"] = self.venue_stats_df["venue_avg_first_inn"].fillna(global_avg)
+        self.venue_stats_df["venue_chase_success_rate"] = self.venue_stats_df["venue_chase_success_rate"].fillna(0.5)
+        self.venue_stats_df["venue_matches"] = self.venue_stats_df["venue_matches"].fillna(0)
 
     def _precompute_player_stats(self):
         """Pre-compute player rolling stats for all players."""

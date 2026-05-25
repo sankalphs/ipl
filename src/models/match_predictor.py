@@ -121,10 +121,14 @@ class MatchPredictor:
 
         return self
 
-    def predict(self, features: dict) -> dict:
+    def predict(self, features: dict, team1: str = None, team2: str = None) -> dict:
         """Predict match outcome from feature dict."""
         if not self.is_trained:
             raise ValueError("Model not trained yet")
+
+        # Get team names from features or parameters
+        t1 = team1 or features.get("team1", "Team 1")
+        t2 = team2 or features.get("team2", "Team 2")
 
         X = pd.DataFrame([{k: v for k, v in features.items() if k in self.feature_cols}])
         X = X[self.feature_cols].fillna(0)
@@ -138,7 +142,7 @@ class MatchPredictor:
         return {
             "team1_win_probability": ensemble_prob,
             "team2_win_probability": 1 - ensemble_prob,
-            "predicted_winner": features["team1"] if ensemble_prob > 0.5 else features["team2"],
+            "predicted_winner": t1 if ensemble_prob > 0.5 else t2,
             "confidence": max(ensemble_prob, 1 - ensemble_prob),
             "xgb_probability": xgb_prob,
             "lr_probability": lr_prob,
