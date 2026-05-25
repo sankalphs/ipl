@@ -6,80 +6,22 @@ Main Streamlit Application
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
-from pathlib import Path
-import joblib
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.data.preprocessing import preprocess_all, CURRENT_TEAMS
-from src.data.player_registry import PlayerRegistry
-from src.data.fast_features import FastFeatureEngineer
+from src.app.cache import load_data, load_registry, load_models
 
-# Page config
+# Page config - no emoji to avoid Windows path issues
 st.set_page_config(
     page_title="IPL Analytics Platform",
-    page_icon=":cricket_bat_and_ball:",
+    page_icon="IPL",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ============================================================
-# Data Loading (cached)
-# ============================================================
-
-@st.cache_resource
-def load_data():
-    """Load and preprocess data."""
-    matches, balls = preprocess_all("dataset")
-    return matches, balls
-
-
-@st.cache_resource
-def load_registry():
-    """Load player registry."""
-    try:
-        return joblib.load("outputs/registry.pkl")
-    except FileNotFoundError:
-        matches, balls = load_data()
-        registry = PlayerRegistry(balls, matches)
-        registry.build()
-        return registry
-
-
-@st.cache_resource
-def load_models():
-    """Load all trained models."""
-    from src.models.match_predictor import MatchPredictor
-    from src.models.win_probability import WinProbabilityEstimator
-    from src.models.score_predictor import ScorePredictor
-    from src.models.player_performance import PlayerPerformancePredictor
-
-    models = {}
-    try:
-        models["match"] = MatchPredictor().load("outputs/match_predictor.pkl")
-    except:
-        models["match"] = None
-    try:
-        models["win_prob"] = WinProbabilityEstimator().load("outputs/win_probability.pkl")
-    except:
-        models["win_prob"] = None
-    try:
-        models["score"] = ScorePredictor().load("outputs/score_predictor.pkl")
-    except:
-        models["score"] = None
-    try:
-        models["player"] = PlayerPerformancePredictor().load("outputs/player_performance.pkl")
-    except:
-        models["player"] = None
-    return models
-
-
-# ============================================================
-# Main Page
-# ============================================================
 
 def main_page():
     st.title("IPL Analytics & Prediction Platform")
@@ -99,27 +41,23 @@ def main_page():
 
     st.markdown("---")
 
-    # Recent matches
     st.subheader("Recent Matches")
     recent = matches[matches["has_result"] == True].sort_values("match_id", ascending=False).head(10)
     display_df = recent[["date", "team1", "team2", "venue", "winner", "season"]].copy()
     display_df.columns = ["Date", "Team 1", "Team 2", "Venue", "Winner", "Season"]
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, width="stretch")
 
-    # Season overview
     st.subheader("Matches per Season")
     season_counts = matches.groupby("season").size().reset_index(name="matches")
     fig = px.bar(season_counts, x="season", y="matches", title="Matches per Season")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
-# ============================================================
-# Sidebar Navigation
-# ============================================================
-
+# Sidebar navigation
 page = st.sidebar.selectbox(
     "Navigate",
-    ["Home", "Match Predictor", "Live Simulator", "Player Insights", "Team Analytics"]
+    ["Home", "Match Predictor", "Live Simulator", "Player Insights", "Team Analytics"],
+    key="nav_selectbox",
 )
 
 if page == "Home":
