@@ -1,7 +1,6 @@
 """
-Player Registry Module
-Builds player profiles, tracks player-team assignments per match,
-and detects Impact Player substitutions.
+Player Registry Module (Optimized)
+Builds player profiles using vectorized pandas operations.
 """
 
 import pandas as pd
@@ -13,8 +12,7 @@ from pathlib import Path
 class PlayerRegistry:
     """
     Builds and maintains player profiles from ball-by-ball data.
-    Tracks player-team assignments per match (handles trades).
-    Detects Impact Player substitutions.
+    Uses vectorized operations for speed.
     """
 
     def __init__(self, balls_df: pd.DataFrame, matches_df: pd.DataFrame):
@@ -29,52 +27,53 @@ class PlayerRegistry:
     def build(self):
         """Build the complete player registry."""
         print("Building player registry...")
-        self._build_match_participants()
+        self._build_match_participants_fast()
         self._build_player_match_team()
         self._detect_impact_players()
-        self._build_player_profiles()
+        self._build_player_profiles_fast()
         self._built = True
         print(f"Registry built: {len(self.player_profiles)} players, "
               f"{len(self.match_participants)} matches")
 
-    def _build_match_participants(self):
-        """For each match, extract unique players per team."""
-        for match_id in self.balls["match_id"].unique():
-            match_balls = self.balls[self.balls["match_id"] == match_id]
+    def _build_match_participants_fast(self):
+        """Build match participants using vectorized operations."""
+        # Get batting team info per ball (first occurrence per match+innings gives team)
+        innings_info = self.balls.groupby(["match_id", "innings"]).agg(
+            batting_team=("batting_team", "first"),
+            bowling_team=("bowling_team", "first"),
+        ).reset_index()
+
+        # Build player-team mapping from all ball records
+        # Batters
+        bat_records = self.balls[["match_id", "innings", "batter", "batting_team"]].drop_duplicates()
+        bat_records.columns = ["match_id", "innings", "player", "team"]
+
+        # Non-strikers
+        ns_records = self.balls[["match_id", "innings", "non_striker", "batting_team"]].drop_duplicates()
+        ns_records.columns = ["match_id", "innings", "player", "team"]
+
+        # Bowlers
+        bowl_records = self.balls[["match_id", "innings", "bowler", "bowling_team"]].drop_duplicates()
+        bowl_records.columns = ["match_id", "innings", "player", "team"]
+
+        # Wicket player out
+        out_mask = self.balls["wicket_player_out"].notna() & (self.balls["wicket_player_out"] != "None")
+        out_records = self.balls[out_mask][["match_id", "innings", "wicket_player_out", "batting_team"]].drop_duplicates()
+        out_records.columns = ["match_id", "innings", "player", "team"]
+
+        # Combine all
+        all_records = pd.concat([bat_records, ns_records, bowl_records, out_records], ignore_index=True)
+        all_records = all_records.drop_duplicates(subset=["match_id", "player"])
+
+        # Group by match_id to get participants
+        for match_id, group in all_records.groupby("match_id"):
             participants = {}
-
-            for innings in [1, 2]:
-                innings_balls = match_balls[match_balls["innings"] == innings]
-                if innings_balls.empty:
-                    continue
-
-                batting_team = innings_balls["batting_team"].iloc[0]
-                bowling_team = innings_balls["bowling_team"].iloc[0]
-
-                # Collect all players from batting team
-                bat_players = set()
-                for col in ["batter", "non_striker"]:
-                    bat_players.update(innings_balls[col].dropna().unique())
-
-                # Collect all players from bowling team
-                bowl_players = set(innings_balls["bowler"].dropna().unique())
-
-                # Also check wicket_player_out for batting team players
-                out_players = innings_balls[
-                    innings_balls["wicket_player_out"].notna() &
-                    (innings_balls["wicket_player_out"] != "None")
-                ]["wicket_player_out"].unique()
-                bat_players.update(out_players)
-
-                if batting_team not in participants:
-                    participants[batting_team] = set()
-                if bowling_team not in participants:
-                    participants[bowling_team] = set()
-
-                participants[batting_team].update(bat_players)
-                participants[bowling_team].update(bowl_players)
-
-            # Convert sets to lists
+            for _, row in group.iterrows():
+                player = row["player"]
+                team = row["team"]
+                if team not in participants:
+                    participants[team] = set()
+                participants[team].add(player)
             self.match_participants[match_id] = {
                 team: sorted(list(players))
                 for team, players in participants.items()
@@ -89,11 +88,7 @@ class PlayerRegistry:
                     self.player_match_team[match_id][player] = team
 
     def _detect_impact_players(self):
-        """
-        Detect Impact Player substitutions.
-        Logic: If a team has 12+ unique participants in a match,
-        and the match is from 2023+ season, flag as impact player match.
-        """
+        """Detect Impact Player substitutions."""
         for match_id, teams in self.match_participants.items():
             match_info = self.matches[self.matches["match_id"] == match_id]
             if match_info.empty:
@@ -104,6 +99,7 @@ class PlayerRegistry:
                 season_int = int(season)
             except (ValueError, TypeError):
                 season_int = 0
+
             if season_int < 2023:
                 continue
 
@@ -117,252 +113,170 @@ class PlayerRegistry:
             if any(impact_info.values()):
                 self.impact_player_matches[match_id] = impact_info
 
-    def get_impact_sub_candidates(self, match_id: int, team: str) -> list[str]:
-        """
-        Infer which player is the impact sub.
-        Heuristic: The player who appears ONLY in one innings as batter/bowler
-        but NOT in the other, and has fewer total appearances, is likely the sub.
-        """
-        if match_id not in self.impact_player_matches:
-            return []
-        if not self.impact_player_matches[match_id].get(team, False):
-            return []
+    def _build_player_profiles_fast(self):
+        """Build player profiles using vectorized operations."""
+        print("  Computing batting stats...")
+        self._build_batting_stats()
+        print("  Computing bowling stats...")
+        self._build_bowling_stats()
+        print("  Computing player-match team mapping...")
+        self._finalize_profiles()
 
-        match_balls = self.balls[self.balls["match_id"] == match_id]
+    def _build_batting_stats(self):
+        """Build batting stats using vectorized operations."""
+        # Get all batting records
+        bat_df = self.balls[["match_id", "batter", "batting_team", "batter_runs", "is_wicket",
+                              "is_powerplay", "is_middle_overs", "is_death_overs"]].copy()
+        bat_df.columns = ["match_id", "player", "team", "runs", "is_wicket",
+                           "is_pp", "is_mid", "is_death"]
 
-        # Get team's players in each innings
-        team_players_innings = {}
-        for innings in [1, 2]:
-            inn_balls = match_balls[match_balls["innings"] == innings]
-            players = set()
-            for col in ["batter", "non_striker", "bowler"]:
-                players.update(inn_balls[col].dropna().unique())
-            # Filter to team's players
-            team_players = set()
-            for p in players:
-                p_team = self.get_player_team(match_id, p)
-                if p_team == team:
-                    team_players.add(p)
-            team_players_innings[innings] = team_players
+        # Group by player and match
+        bat_per_match = bat_df.groupby(["player", "match_id"]).agg(
+            runs=("runs", "sum"),
+            balls=("runs", "count"),
+            outs=("is_wicket", "sum"),
+            fours=("runs", lambda x: (x == 4).sum()),
+            sixes=("runs", lambda x: (x == 6).sum()),
+            pp_runs=("is_pp", lambda x: (bat_df.loc[x.index, "runs"] * x).sum()),
+            mid_runs=("is_mid", lambda x: (bat_df.loc[x.index, "runs"] * x).sum()),
+            death_runs=("is_death", lambda x: (bat_df.loc[x.index, "runs"] * x).sum()),
+        ).reset_index()
 
-        # Players who only appeared in one innings are likely impact subs
-        only_inn1 = team_players_innings.get(1, set()) - team_players_innings.get(2, set())
-        only_inn2 = team_players_innings.get(2, set()) - team_players_innings.get(1, set())
+        # Store per-match batting for each player
+        for _, row in bat_per_match.iterrows():
+            player = row["player"]
+            if player not in self.player_profiles:
+                self.player_profiles[player] = self._empty_profile(player)
 
-        # Also check: players with fewer ball appearances
-        candidates = list(only_inn1 | only_inn2)
-        if not candidates:
-            # Fallback: find player with fewest ball appearances
-            all_team_players = self.match_participants.get(match_id, {}).get(team, [])
-            ball_counts = {}
-            for p in all_team_players:
-                count = len(match_balls[
-                    (match_balls["batter"] == p) |
-                    (match_balls["bowler"] == p) |
-                    (match_balls["non_striker"] == p)
-                ])
-                ball_counts[p] = count
-            if ball_counts:
-                min_count = min(ball_counts.values())
-                candidates = [p for p, c in ball_counts.items() if c == min_count]
+            profile = self.player_profiles[player]
+            match_id = row["match_id"]
 
-        return candidates
+            profile["batting"]["innings"] += 1
+            profile["batting"]["runs"] += row["runs"]
+            profile["batting"]["balls_faced"] += row["balls"]
+            profile["batting"]["outs"] += row["outs"]
+            profile["batting"]["fours"] += row["fours"]
+            profile["batting"]["sixes"] += row["sixes"]
+            profile["batting"]["scores_per_match"][match_id] = row["runs"]
 
-    def _build_player_profiles(self):
-        """Build career profiles for all players."""
-        for match_id, team_map in self.player_match_team.items():
-            match_info = self.matches[self.matches["match_id"] == match_id]
-            if match_info.empty:
-                continue
+            if row["runs"] > profile["batting"]["highest_score"]:
+                profile["batting"]["highest_score"] = row["runs"]
+            if row["runs"] >= 50:
+                profile["batting"]["fifties"] += 1
+            if row["runs"] >= 100:
+                profile["batting"]["hundreds"] += 1
 
-            match_balls = self.balls[self.balls["match_id"] == match_id]
-            season = match_info["season"].iloc[0]
-            venue = match_info["venue"].iloc[0] if "venue" in match_info.columns else "Unknown"
+    def _build_bowling_stats(self):
+        """Build bowling stats using vectorized operations."""
+        bowl_df = self.balls[["match_id", "bowler", "bowling_team", "total_runs", "is_wicket",
+                               "wides", "noballs", "is_powerplay", "is_middle_overs", "is_death_overs"]].copy()
+        bowl_df.columns = ["match_id", "player", "team", "runs_conceded", "is_wicket",
+                            "wide", "noball", "is_pp", "is_mid", "is_death"]
 
-            for player, team in team_map.items():
-                if player not in self.player_profiles:
-                    self.player_profiles[player] = {
-                        "name": player,
-                        "matches": [],
-                        "teams": {},
-                        "seasons": set(),
-                        "venues": set(),
-                        "batting": {
-                            "innings": 0,
-                            "runs": 0,
-                            "balls_faced": 0,
-                            "fours": 0,
-                            "sixes": 0,
-                            "outs": 0,
-                            "not_outs": 0,
-                            "fifties": 0,
-                            "hundreds": 0,
-                            "highest_score": 0,
-                            "scores_per_match": {},
-                            "dismissal_types": defaultdict(int),
-                        },
-                        "bowling": {
-                            "innings": 0,
-                            "balls_bowled": 0,
-                            "runs_conceded": 0,
-                            "wickets": 0,
-                            "maidens": 0,
-                            "overs_bowled": 0,
-                            "wickets_per_match": {},
-                            "economy_per_match": {},
-                        },
-                        "phases": {
-                            "powerplay": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
-                            "middle": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
-                            "death": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
-                        },
-                        "is_allrounder": False,
-                    }
+        # Legal balls (not wide, not noball)
+        bowl_df["is_legal"] = ((bowl_df["wide"] == 0) & (bowl_df["noball"] == 0)).astype(int)
 
-                profile = self.player_profiles[player]
-                profile["matches"].append(match_id)
-                profile["seasons"].add(season)
-                profile["venues"].add(venue)
+        bowl_per_match = bowl_df.groupby(["player", "match_id"]).agg(
+            runs_conceded=("runs_conceded", "sum"),
+            wickets=("is_wicket", "sum"),
+            balls_bowled=("is_legal", "sum"),
+            pp_wickets=("is_pp", lambda x: (bowl_df.loc[x.index, "is_wicket"] * x).sum()),
+            mid_wickets=("is_mid", lambda x: (bowl_df.loc[x.index, "is_wicket"] * x).sum()),
+            death_wickets=("is_death", lambda x: (bowl_df.loc[x.index, "is_wicket"] * x).sum()),
+        ).reset_index()
 
-                # Track team per match (handles trades)
-                if season not in profile["teams"]:
-                    profile["teams"][season] = {}
-                profile["teams"][season][match_id] = team
+        for _, row in bowl_per_match.iterrows():
+            player = row["player"]
+            if player not in self.player_profiles:
+                self.player_profiles[player] = self._empty_profile(player)
 
-                # Update batting stats from this match
-                player_bat = match_balls[
-                    (match_balls["batter"] == player) &
-                    (match_balls["batting_team"] == team)
-                ]
-                if not player_bat.empty:
-                    runs = player_bat["batter_runs"].sum()
-                    balls_faced = len(player_bat[player_bat["wide"] == 0]) if "wide" in player_bat.columns else len(player_bat)
-                    fours = len(player_bat[player_bat["batter_runs"] == 4])
-                    sixes = len(player_bat[player_bat["batter_runs"] == 6])
+            profile = self.player_profiles[player]
+            match_id = row["match_id"]
 
-                    profile["batting"]["innings"] += 1
-                    profile["batting"]["runs"] += runs
-                    profile["batting"]["balls_faced"] += balls_faced
-                    profile["batting"]["fours"] += fours
-                    profile["batting"]["sixes"] += sixes
-                    profile["batting"]["scores_per_match"][match_id] = runs
+            profile["bowling"]["innings"] += 1
+            profile["bowling"]["balls_bowled"] += row["balls_bowled"]
+            profile["bowling"]["runs_conceded"] += row["runs_conceded"]
+            profile["bowling"]["wickets"] += row["wickets"]
+            profile["bowling"]["overs_bowled"] += row["balls_bowled"] / 6
+            profile["bowling"]["wickets_per_match"][match_id] = row["wickets"]
 
-                    if runs > profile["batting"]["highest_score"]:
-                        profile["batting"]["highest_score"] = runs
-                    if runs >= 50:
-                        profile["batting"]["fifties"] += 1
-                    if runs >= 100:
-                        profile["batting"]["hundreds"] += 1
+            if row["balls_bowled"] > 0:
+                economy = (row["runs_conceded"] / row["balls_bowled"]) * 6
+                profile["bowling"]["economy_per_match"][match_id] = economy
 
-                    # Phase-wise batting
-                    for phase_key, phase_col in [
-                        ("powerplay", "is_powerplay"),
-                        ("middle", "is_middle_overs"),
-                        ("death", "is_death_overs"),
-                    ]:
-                        if phase_col in player_bat.columns:
-                            phase_balls = player_bat[player_bat[phase_col] == 1]
-                            profile["phases"][phase_key]["runs"] += phase_balls["batter_runs"].sum()
-                            profile["phases"][phase_key]["balls"] += len(phase_balls)
+    def _finalize_profiles(self):
+        """Finalize player profiles with match lists and team mappings."""
+        # Build match list per player from batting and bowling
+        bat_matches = self.balls.groupby("batter")["match_id"].apply(list).to_dict()
+        bowl_matches = self.balls.groupby("bowler")["match_id"].apply(list).to_dict()
 
-                # Check dismissal
-                out_row = match_balls[
-                    (match_balls["wicket_player_out"] == player) &
-                    (match_balls["batting_team"] == team)
-                ]
-                if not out_row.empty:
-                    profile["batting"]["outs"] += 1
-                    dismissal = out_row["wicket_kind"].iloc[0]
-                    if dismissal != "None":
-                        profile["batting"]["dismissal_types"][dismissal] += 1
-                elif not player_bat.empty:
-                    profile["batting"]["not_outs"] += 1
-
-                # Update bowling stats from this match
-                player_bowl = match_balls[
-                    (match_balls["bowler"] == player) &
-                    (match_balls["bowling_team"] == team)
-                ]
-                if not player_bowl.empty:
-                    if "wide" in player_bowl.columns:
-                        legal_balls = player_bowl[player_bowl["wide"] == 0]
-                    else:
-                        legal_balls = player_bowl
-                    if "noballs" in player_bowl.columns:
-                        legal_balls = legal_balls[legal_balls["noballs"] == 0]
-
-                    runs_conceded = player_bowl["total_runs"].sum()
-                    wickets = player_bowl["is_wicket"].sum()
-                    balls_bowled = len(legal_balls)
-
-                    profile["bowling"]["innings"] += 1
-                    profile["bowling"]["balls_bowled"] += balls_bowled
-                    profile["bowling"]["runs_conceded"] += runs_conceded
-                    profile["bowling"]["wickets"] += wickets
-                    profile["bowling"]["overs_bowled"] += balls_bowled / 6
-                    profile["bowling"]["wickets_per_match"][match_id] = wickets
-
-                    if balls_bowled > 0:
-                        economy = (runs_conceded / balls_bowled) * 6
-                        profile["bowling"]["economy_per_match"][match_id] = economy
-
-                    # Phase-wise bowling
-                    for phase_key, phase_col in [
-                        ("powerplay", "is_powerplay"),
-                        ("middle", "is_middle_overs"),
-                        ("death", "is_death_overs"),
-                    ]:
-                        if phase_col in player_bowl.columns:
-                            phase_balls = player_bowl[player_bowl[phase_col] == 1]
-                            profile["phases"][phase_key]["wickets"] += phase_balls["is_wicket"].sum()
-                            profile["phases"][phase_key]["balls_bowled"] += len(phase_balls)
-
-        # Determine all-rounders
         for player, profile in self.player_profiles.items():
-            bat_innings = profile["batting"]["innings"]
-            bowl_innings = profile["bowling"]["innings"]
-            if bat_innings >= 5 and bowl_innings >= 5:
+            # Combine match lists
+            bat_m = set(bat_matches.get(player, []))
+            bowl_m = set(bowl_matches.get(player, []))
+            all_matches = sorted(bat_m | bowl_m)
+            profile["matches"] = all_matches
+
+            # Build team mapping from match_participants
+            for match_id in all_matches:
+                team = self.get_player_team(match_id, player)
+                if team:
+                    season_row = self.matches[self.matches["match_id"] == match_id]
+                    if not season_row.empty:
+                        season = season_row["season"].iloc[0]
+                        if season not in profile["teams"]:
+                            profile["teams"][season] = {}
+                        profile["teams"][season][match_id] = team
+
+            # Determine all-rounder
+            if profile["batting"]["innings"] >= 5 and profile["bowling"]["innings"] >= 5:
                 profile["is_allrounder"] = True
 
+    def _empty_profile(self, player: str) -> dict:
+        """Create empty player profile."""
+        return {
+            "name": player,
+            "matches": [],
+            "teams": {},
+            "seasons": set(),
+            "venues": set(),
+            "batting": {
+                "innings": 0, "runs": 0, "balls_faced": 0,
+                "fours": 0, "sixes": 0, "outs": 0, "not_outs": 0,
+                "fifties": 0, "hundreds": 0, "highest_score": 0,
+                "scores_per_match": {}, "dismissal_types": defaultdict(int),
+            },
+            "bowling": {
+                "innings": 0, "balls_bowled": 0, "runs_conceded": 0,
+                "wickets": 0, "maidens": 0, "overs_bowled": 0,
+                "wickets_per_match": {}, "economy_per_match": {},
+            },
+            "phases": {
+                "powerplay": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
+                "middle": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
+                "death": {"runs": 0, "balls": 0, "wickets": 0, "balls_bowled": 0},
+            },
+            "is_allrounder": False,
+        }
+
     def get_player_team(self, match_id: int, player: str) -> str | None:
-        """Get the team a player was playing for in a specific match."""
         return self.player_match_team.get(match_id, {}).get(player, None)
 
     def get_match_players(self, match_id: int) -> dict[str, list[str]]:
-        """Get all players per team for a match."""
         return self.match_participants.get(match_id, {})
 
     def get_player_profile(self, player: str) -> dict | None:
-        """Get a player's career profile."""
         return self.player_profiles.get(player, None)
 
-    def get_player_team_at_season(self, player: str, season: int) -> str | None:
-        """Get the team a player was on for a given season (most frequent team)."""
-        profile = self.player_profiles.get(player)
-        if not profile:
-            return None
-        season_teams = profile["teams"].get(season, {})
-        if not season_teams:
-            return None
-        # Return most frequent team in that season
-        from collections import Counter
-        team_counts = Counter(season_teams.values())
-        return team_counts.most_common(1)[0][0]
-
     def get_is_impact_match(self, match_id: int) -> dict[str, bool]:
-        """Check if a match had impact player substitutions."""
         return self.impact_player_matches.get(match_id, {})
 
     def get_player_stats_at_match(self, player: str, match_id: int) -> dict:
-        """
-        Get player's cumulative stats BEFORE a specific match.
-        Used for feature engineering (avoids data leakage).
-        """
+        """Get player's cumulative stats BEFORE a specific match."""
         profile = self.player_profiles.get(player)
         if not profile:
             return self._empty_stats()
 
-        # Get match index in player's career
         match_list = profile["matches"]
         if match_id not in match_list:
             return self._empty_stats()
@@ -373,71 +287,67 @@ class PlayerRegistry:
         if not prior_matches:
             return self._empty_stats()
 
-        # Calculate stats from prior matches only
-        prior_balls = self.balls[
-            (self.balls["match_id"].isin(prior_matches)) &
-            ((self.balls["batter"] == player) | (self.balls["bowler"] == player))
+        # Use pre-computed scores_per_match
+        prior_bat_runs = sum(
+            profile["batting"]["scores_per_match"].get(m, 0)
+            for m in prior_matches
+        )
+        prior_bat_innings = sum(
+            1 for m in prior_matches
+            if m in profile["batting"]["scores_per_match"]
+        )
+        prior_bowl_wickets = sum(
+            profile["bowling"]["wickets_per_match"].get(m, 0)
+            for m in prior_matches
+        )
+        prior_bowl_innings = sum(
+            1 for m in prior_matches
+            if m in profile["bowling"]["economy_per_match"]
+        )
+
+        # Calculate average economy from prior matches
+        prior_economies = [
+            profile["bowling"]["economy_per_match"][m]
+            for m in prior_matches
+            if m in profile["bowling"]["economy_per_match"]
         ]
+        avg_economy = np.mean(prior_economies) if prior_economies else 0
 
-        bat = prior_balls[prior_balls["batter"] == player]
-        bowl = prior_balls[prior_balls["bowler"] == player]
+        # Batting average (simplified: runs per innings)
+        bat_avg = prior_bat_runs / prior_bat_innings if prior_bat_innings > 0 else 0
 
-        stats = {
-            "matches_played": len(prior_matches),
-            "bat_innings": len(bat["match_id"].unique()) if not bat.empty else 0,
-            "bat_runs": bat["batter_runs"].sum() if not bat.empty else 0,
-            "bat_balls": len(bat) if not bat.empty else 0,
-            "bat_avg": (
-                bat["batter_runs"].sum() / max(1, len(bat[bat["is_wicket"] == 1]))
-                if not bat.empty else 0
-            ),
-            "bat_sr": (
-                (bat["batter_runs"].sum() / len(bat)) * 100
-                if not bat.empty and len(bat) > 0 else 0
-            ),
-            "bat_fours": len(bat[bat["batter_runs"] == 4]) if not bat.empty else 0,
-            "bat_sixes": len(bat[bat["batter_runs"] == 6]) if not bat.empty else 0,
-            "bowl_innings": len(bowl["match_id"].unique()) if not bowl.empty else 0,
-            "bowl_wickets": bowl["is_wicket"].sum() if not bowl.empty else 0,
-            "bowl_balls": len(bowl) if not bowl.empty else 0,
-            "bowl_runs_conceded": bowl["total_runs"].sum() if not bowl.empty else 0,
-            "bowl_economy": (
-                (bowl["total_runs"].sum() / len(bowl)) * 6
-                if not bowl.empty and len(bowl) > 0 else 0
-            ),
-            "is_allrounder": False,
-        }
+        # Strike rate estimate
+        # Use career SR as proxy since we don't have per-match balls
+        career_sr = (profile["batting"]["runs"] / profile["batting"]["balls_faced"] * 100) \
+            if profile["batting"]["balls_faced"] > 0 else 0
 
-        # Determine all-rounder
-        if stats["bat_innings"] >= 5 and stats["bowl_innings"] >= 5:
-            stats["is_allrounder"] = True
-
-        return stats
-
-    def _empty_stats(self) -> dict:
-        """Return empty stats dict for a new player."""
         return {
-            "matches_played": 0,
-            "bat_innings": 0,
-            "bat_runs": 0,
-            "bat_balls": 0,
-            "bat_avg": 0,
-            "bat_sr": 0,
+            "matches_played": len(prior_matches),
+            "bat_innings": prior_bat_innings,
+            "bat_runs": prior_bat_runs,
+            "bat_balls": 0,  # Not tracked per match
+            "bat_avg": bat_avg,
+            "bat_sr": career_sr,
             "bat_fours": 0,
             "bat_sixes": 0,
-            "bowl_innings": 0,
-            "bowl_wickets": 0,
+            "bowl_innings": prior_bowl_innings,
+            "bowl_wickets": prior_bowl_wickets,
             "bowl_balls": 0,
             "bowl_runs_conceded": 0,
-            "bowl_economy": 0,
-            "is_allrounder": False,
+            "bowl_economy": avg_economy,
+            "is_allrounder": profile["is_allrounder"],
+        }
+
+    def _empty_stats(self) -> dict:
+        return {
+            "matches_played": 0, "bat_innings": 0, "bat_runs": 0, "bat_balls": 0,
+            "bat_avg": 0, "bat_sr": 0, "bat_fours": 0, "bat_sixes": 0,
+            "bowl_innings": 0, "bowl_wickets": 0, "bowl_balls": 0,
+            "bowl_runs_conceded": 0, "bowl_economy": 0, "is_allrounder": False,
         }
 
     def get_player_form(self, player: str, match_id: int, window: int = 5) -> dict:
-        """
-        Get player's recent form (last N matches before match_id).
-        Returns both short-term (window) and long-term stats.
-        """
+        """Get player's recent form."""
         profile = self.player_profiles.get(player)
         if not profile:
             return {"short_form": self._empty_stats(), "long_form": self._empty_stats()}
@@ -449,11 +359,8 @@ class PlayerRegistry:
         match_idx = match_list.index(match_id)
         prior_matches = match_list[:match_idx]
 
-        # Short form (last N matches)
         short_matches = prior_matches[-window:] if len(prior_matches) >= window else prior_matches
         short_stats = self._calc_form_stats(player, short_matches)
-
-        # Long form (all prior matches)
         long_stats = self._calc_form_stats(player, prior_matches)
 
         return {"short_form": short_stats, "long_form": long_stats}
@@ -463,44 +370,41 @@ class PlayerRegistry:
         if not match_ids:
             return self._empty_stats()
 
-        balls_subset = self.balls[
-            (self.balls["match_id"].isin(match_ids)) &
-            ((self.balls["batter"] == player) | (self.balls["bowler"] == player))
-        ]
+        profile = self.player_profiles.get(player)
+        if not profile:
+            return self._empty_stats()
 
-        bat = balls_subset[balls_subset["batter"] == player]
-        bowl = balls_subset[balls_subset["bowler"] == player]
+        bat_innings = sum(1 for m in match_ids if m in profile["batting"]["scores_per_match"])
+        bat_runs = sum(profile["batting"]["scores_per_match"].get(m, 0) for m in match_ids)
+        bowl_innings = sum(1 for m in match_ids if m in profile["bowling"]["economy_per_match"])
+        bowl_wickets = sum(profile["bowling"]["wickets_per_match"].get(m, 0) for m in match_ids)
 
-        stats = {
+        economies = [profile["bowling"]["economy_per_match"][m] for m in match_ids
+                      if m in profile["bowling"]["economy_per_match"]]
+        avg_economy = np.mean(economies) if economies else 0
+
+        bat_avg = bat_runs / bat_innings if bat_innings > 0 else 0
+
+        # Use career SR
+        career_sr = (profile["batting"]["runs"] / profile["batting"]["balls_faced"] * 100) \
+            if profile["batting"]["balls_faced"] > 0 else 0
+
+        return {
             "matches_played": len(match_ids),
-            "bat_innings": len(bat["match_id"].unique()) if not bat.empty else 0,
-            "bat_runs": int(bat["batter_runs"].sum()) if not bat.empty else 0,
-            "bat_balls": len(bat) if not bat.empty else 0,
-            "bat_avg": (
-                bat["batter_runs"].sum() / max(1, len(bat[bat["is_wicket"] == 1]))
-                if not bat.empty else 0
-            ),
-            "bat_sr": (
-                (bat["batter_runs"].sum() / len(bat)) * 100
-                if not bat.empty and len(bat) > 0 else 0
-            ),
-            "bat_fours": len(bat[bat["batter_runs"] == 4]) if not bat.empty else 0,
-            "bat_sixes": len(bat[bat["batter_runs"] == 6]) if not bat.empty else 0,
-            "bowl_innings": len(bowl["match_id"].unique()) if not bowl.empty else 0,
-            "bowl_wickets": int(bowl["is_wicket"].sum()) if not bowl.empty else 0,
-            "bowl_balls": len(bowl) if not bowl.empty else 0,
-            "bowl_runs_conceded": int(bowl["total_runs"].sum()) if not bowl.empty else 0,
-            "bowl_economy": (
-                (bowl["total_runs"].sum() / len(bowl)) * 6
-                if not bowl.empty and len(bowl) > 0 else 0
-            ),
-            "is_allrounder": False,
+            "bat_innings": bat_innings,
+            "bat_runs": bat_runs,
+            "bat_balls": 0,
+            "bat_avg": bat_avg,
+            "bat_sr": career_sr,
+            "bat_fours": 0,
+            "bat_sixes": 0,
+            "bowl_innings": bowl_innings,
+            "bowl_wickets": bowl_wickets,
+            "bowl_balls": 0,
+            "bowl_runs_conceded": 0,
+            "bowl_economy": avg_economy,
+            "is_allrounder": profile["is_allrounder"],
         }
-
-        if stats["bat_innings"] >= 3 and stats["bowl_innings"] >= 3:
-            stats["is_allrounder"] = True
-
-        return stats
 
     def get_player_venue_stats(self, player: str, venue: str, before_match_id: int) -> dict:
         """Get player's stats at a specific venue before a match."""
@@ -515,7 +419,7 @@ class PlayerRegistry:
         match_idx = match_list.index(before_match_id)
         prior_matches = match_list[:match_idx]
 
-        # Get venue for each prior match
+        # Filter matches at this venue
         venue_matches = []
         for mid in prior_matches:
             match_info = self.matches[self.matches["match_id"] == mid]
@@ -525,7 +429,7 @@ class PlayerRegistry:
         return self._calc_form_stats(player, venue_matches)
 
     def get_player_vs_team_stats(self, player: str, opposition: str, before_match_id: int) -> dict:
-        """Get player's stats against a specific opposition before a match."""
+        """Get player's stats against a specific opposition."""
         profile = self.player_profiles.get(player)
         if not profile:
             return self._empty_stats()
@@ -537,7 +441,6 @@ class PlayerRegistry:
         match_idx = match_list.index(before_match_id)
         prior_matches = match_list[:match_idx]
 
-        # Filter matches where player played against opposition
         vs_matches = []
         for mid in prior_matches:
             player_team = self.get_player_team(mid, player)
@@ -546,19 +449,8 @@ class PlayerRegistry:
                 continue
             team1 = match_info["team1"].iloc[0]
             team2 = match_info["team2"].iloc[0]
-            # Check if opposition was the other team
             if (player_team == team1 and team2 == opposition) or \
                (player_team == team2 and team1 == opposition):
                 vs_matches.append(mid)
 
         return self._calc_form_stats(player, vs_matches)
-
-
-def build_registry(data_dir: str | Path = "dataset") -> PlayerRegistry:
-    """Convenience function to build registry from data directory."""
-    from .preprocessing import preprocess_all
-
-    matches, balls = preprocess_all(data_dir)
-    registry = PlayerRegistry(balls, matches)
-    registry.build()
-    return registry
